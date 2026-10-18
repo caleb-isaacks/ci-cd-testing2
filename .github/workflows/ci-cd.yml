@@ -1,25 +1,87 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-name: Run Azure Login with OIDC
-on: [push]
-
+# .github/workflows/oidc-test.yml
+# Tests GitHub Actions -> Azure authentication using OIDC (no stored client secret).
+ 
+name: OIDC Test (Azure)
+ 
+on:
+  workflow_dispatch:          # run manually from the Actions tab
+  push:
+    branches:
+      - testing               # must match the federated credential subject in Azure
+ 
+# Required for OIDC: lets the job request a GitHub-issued ID token
 permissions:
   id-token: write
   contents: read
+ 
 jobs:
-  build-and-deploy:
+  oidc-login-test:
     runs-on: ubuntu-latest
+ 
     steps:
-      - name: 'Az CLI login'
-        uses: azure/login@8c334a195cbb38e46038007b304988d888bf676a
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Azure login via OIDC
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: 'Run az commands'
+ 
+      - name: Confirm identity
         run: |
-          az account show
-          az group list
+          echo "Logged in as:"
+          az account show --query "{subscription:name, subscriptionId:id, tenant:tenantId, user:user.name}" -o table
+ 
+      - name: Confirm permissions (list resource groups)
+        run: az group list --query "[].{name:name, location:location}" -o table
+ 
+  # Optional: proves Terraform's azurerm provider can also auth with OIDC.
+  # Remove this job if you only want the login test.
+  terraform-oidc-test:
+    runs-on: ubuntu-latest
+    needs: oidc-login-test
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+ 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+ 
+      - name: Write a minimal test config
+        run: |
+          mkdir -p oidc-tf-test && cd oidc-tf-test
+          cat > main.tf <<'EOF'
+          terraform {
+            required_providers {
+              azurerm = {
+                source  = "hashicorp/azurerm"
+                version = "~> 4.0"
+              }
+            }
+          }
+ 
+          provider "azurerm" {
+            features {}
+            use_oidc = true
+          }
+ 
+          data "azurerm_subscription" "current" {}
+ 
+          output "subscription_name" {
+            value = data.azurerm_subscription.current.display_name
+          }
+          EOF
+ 
+      - name: Terraform init and plan
+        working-directory: oidc-tf-test
+        run: |
+          terraform init
+          terraform plan
